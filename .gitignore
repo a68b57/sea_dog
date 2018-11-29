@@ -1,0 +1,7 @@
+# image
+.png
+.PNG
+.tif
+
+# data
+.tfrecord
