@@ -376,6 +376,9 @@ def resnet_model_fn(features, labels, mode, model_class,
 
 	def streaming_counts(y_true, y_pred, num_classes):
 		# Weights for the weighted f1 score
+
+		y_true = tf.cast(y_true,tf.int64)
+
 		weights = metric_variable(
 			shape=[num_classes], dtype=tf.int64, validate_shape=False, name="weights"
 		)
@@ -403,7 +406,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 		# Update ops, as in the previous section:
 		#   - Update ops for the macro f1 score
 		up_tp_mac = tf.assign_add(tp_mac, tf.count_nonzero(y_pred * y_true, axis=0))
-		up_fp_mac = tf.assign_add(fp_mac, tf.count_nonzero(y_pred * (y_true - 1), axis=0))
+		up_fp_mac = tf.assign_add(fp_mac, tf.count_nonzero(y_pred * y_true-1, axis=0))
 		up_fn_mac = tf.assign_add(fn_mac, tf.count_nonzero((y_pred - 1) * y_true, axis=0))
 
 		#   - Update ops for the micro f1 score
@@ -430,7 +433,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 		tp_mac, fp_mac, fn_mac, tp_mic, fp_mic, fn_mic, weights = counts
 
 		# normalize weights
-		weights /= tf.reduce_sum(weights)
+		weights = weights/tf.reduce_sum(weights)
 
 		# computing the micro f1 score
 		prec_mic = tp_mic / (tp_mic + fp_mic)
@@ -447,21 +450,29 @@ def resnet_model_fn(features, labels, mode, model_class,
 
 		return f1_mic, f1_mac, f1_wei
 
-	c, updates = streaming_counts(labels, tf.cast(predictions['k_hot_prediction'], tf.int64), model.num_classes)
-	micro_f1, macro_f1, weighted_f1 = streaming_f1(c)
+	f1s, f1_updates = streaming_counts(labels, tf.cast(predictions['k_hot_prediction'], tf.int64), model.num_classes)
+	micro_f1, macro_f1, weighted_f1 = streaming_f1(f1s)
 
 	# accuracy = tf.metrics.accuracy(labels, predictions['classes'])
 	accuracy = tf.metrics.accuracy(labels, tf.cast(predictions['k_hot_prediction'], tf.int64))
 
-	metrics = {'accuracy': accuracy,
-	           'f1': macro_f1
-	           }
+	metrics = {
+		"accuracy":accuracy,
+		"macro":(macro_f1, f1_updates),
+	}
+
+
+	# metrics = {'accuracy': accuracy,
+	#            'f1': macro_f1}
+
+	# accuracy[0] is local/ batch-wise
+	# accuracy[1] is updated
 
 	# Create a tensor named train_accuracy for logging purposes
 	tf.identity(accuracy[1], name='train_accuracy')
-	tf.identity(macro_f1[1], name='f1-macro')
-	tf.summary.scalar('train_accuracy', accuracy[1])
-	tf.summary.scalar('f1-macro', macro_f1[1])
+	tf.identity(macro_f1, name='f1-macro')
+	tf.summary.scalar('train_accuracy', accuracy[0])
+	tf.summary.scalar('f1-macro', macro_f1)
 
 
 	return tf.estimator.EstimatorSpec(
