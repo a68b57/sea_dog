@@ -21,8 +21,8 @@ _NUM_DATA_FILES = 1
 
 
 _NUM_IMAGES = {
-	'train':25000, # total train 3107  # test: 6215
-	'validation':2000,
+	'train':3107, # total train 3107  # test: 6215
+	'validation':3107,
 }
 
 DATASET_NAME = 'PROTEIN'
@@ -80,7 +80,7 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
 	Returns:
 	  A dataset that can be used for iteration.
 	"""
-	filenames = os.path.join(data_dir, 'train.tfrecord')
+	filenames = os.path.join(data_dir, 'data')
 
 	# dataset = tf.data.FixedLengthRecordDataset(filenames, _RECORD_BYTES) # this only works for CIFAR
 	dataset = tf.data.TFRecordDataset(filenames, buffer_size=_RECORD_BYTES)
@@ -179,13 +179,16 @@ def pilotCNN_model_fn(features, labels, mode, params):
 def define_flags():
 	resnet_run_loop.define_resnet_flags()
 	flags.adopt_module_key_flags(resnet_run_loop)
-	flags_core.set_defaults(data_dir=os.path.dirname(os.path.realpath(__file__)),
+	cwd = os.path.dirname(os.path.realpath(__file__))
+
+	flags_core.set_defaults(data_dir=os.path.join(cwd,'tfrecord'),
 	                        model_dir='model/',
 	                        resnet_size='14',
 	                        train_epochs=1000,
-	                        epochs_between_evals=20,
+	                        epochs_between_evals=1,
 	                        batch_size=3,
-	                        image_bytes_as_serving_input=False)
+	                        image_bytes_as_serving_input=False,
+	                        eval_only = False)
 
 
 def run_pilotCNN(flags_obj):

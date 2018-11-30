@@ -265,6 +265,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 	# not a SparseTensor). If dtype is is low precision, logits must be cast to
 	# fp32 for numerical stability.
 	logits = tf.cast(logits, tf.float32)
+	logits = tf.nn.sigmoid(logits)
 
 	def multi_label_hot(prediction, threshold=0.3):
 		prediction = tf.cast(prediction, tf.float32)
@@ -273,7 +274,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 
 	predictions = {
 		# 'classes': tf.argmax(logits, axis=1),
-		'k_hot_prediction':multi_label_hot(tf.nn.softmax(logits)),
+		'k_hot_prediction':multi_label_hot(logits),
 		'probabilities':tf.nn.softmax(logits, name='softmax_tensor')
 	}
 
@@ -567,7 +568,7 @@ def resnet_main(
 	def input_fn_train(num_epochs):
 		return input_function(
 			is_training=True,
-			data_dir=flags_obj.data_dir,
+			data_dir=os.path.join(flags_obj.data_dir,'train'),
 			batch_size=distribution_utils.per_device_batch_size(
 				flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
 			num_epochs=num_epochs,
@@ -578,7 +579,7 @@ def resnet_main(
 	def input_fn_eval():
 		return input_function(
 			is_training=False,
-			data_dir=flags_obj.data_dir,
+			data_dir=os.path.join(flags_obj.data_dir, 'val'),
 			batch_size=distribution_utils.per_device_batch_size(
 				flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
 			num_epochs=1,
