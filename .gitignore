@@ -8,3 +8,7 @@
 
 # event
 event*
+
+
+# xml
+*.xml
