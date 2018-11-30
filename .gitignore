@@ -5,3 +5,6 @@
 
 # data
 *.tfrecord
+
+# event
+event*
