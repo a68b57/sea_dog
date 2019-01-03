@@ -20,42 +20,201 @@ from utils.flags import core as flags_core
 from utils.export import export
 from utils.logs import hooks_helper
 from utils.logs import logger
-import imagenet_preprocessing
+from utils import imagenet_preprocessing
 from utils.misc import distribution_utils
 from utils.misc import model_helpers
+
+import numpy as np
+
+
+###############################################################################
+# for computing f1-score
+###############################################################################
+
+def metric_variable(shape, dtype, validate_shape=True, name=None):
+	"""Create variable in `GraphKeys.(LOCAL|METRIC_VARIABLES`) collections.
+	from https://github.com/tensorflow/tensorflow/blob/r1.8/tensorflow/python/ops/metrics_impl.py
+	"""
+	return variable_scope.variable(
+		lambda: array_ops.zeros(shape, dtype),
+		trainable=False,
+		collections=[ops.GraphKeys.LOCAL_VARIABLES, ops.GraphKeys.METRIC_VARIABLES],
+		validate_shape=validate_shape,
+		name=name,
+	)
+
+
+def streaming_counts(y_true, y_pred, num_classes):
+	y_true = tf.cast(y_true, tf.int64)
+	y_pred = tf.cast(y_pred, tf.int64)
+	"""Computes the TP, FP and FN counts for the micro and macro f1 scores.
+	The weighted f1 score can be inferred from the macro f1 score provided
+	we compute the weights also.
+	This function also defines the update ops to these counts
+
+	Args:
+		y_true (Tensor): 2D Tensor representing the target labels
+		y_pred (Tensor): 2D Tensor representing the predicted labels
+		num_classes (int): number of possible classes
+	Returns:
+		tuple: the first element in the tuple is itself a tuple grouping the counts,
+		the second element is the grouped update op.
+	"""
+
+	# Weights for the weighted f1 score
+	weights = metric_variable(
+		shape=[num_classes], dtype=tf.int64, validate_shape=False, name="weights"
+	)
+	# Counts for the macro f1 score
+	tp_mac = metric_variable(
+		shape=[num_classes], dtype=tf.int64, validate_shape=False, name="tp_mac"
+	)
+	fp_mac = metric_variable(
+		shape=[num_classes], dtype=tf.int64, validate_shape=False, name="fp_mac"
+	)
+	fn_mac = metric_variable(
+		shape=[num_classes], dtype=tf.int64, validate_shape=False, name="fn_mac"
+	)
+	# Counts for the micro f1 score
+	tp_mic = metric_variable(
+		shape=[], dtype=tf.int64, validate_shape=False, name="tp_mic"
+	)
+	fp_mic = metric_variable(
+		shape=[], dtype=tf.int64, validate_shape=False, name="fp_mic"
+	)
+	fn_mic = metric_variable(
+		shape=[], dtype=tf.int64, validate_shape=False, name="fn_mic"
+	)
+
+	# Update ops, as in the previous section:
+	#   - Update ops for the macro f1 score
+	up_tp_mac = tf.assign_add(tp_mac, tf.count_nonzero(y_pred * y_true, axis=0))
+	up_fp_mac = tf.assign_add(fp_mac, tf.count_nonzero(y_pred * (y_true - 1), axis=0))
+	up_fn_mac = tf.assign_add(fn_mac, tf.count_nonzero((y_pred - 1) * y_true, axis=0))
+
+	#   - Update ops for the micro f1 score
+	up_tp_mic = tf.assign_add(tp_mic, tf.count_nonzero(y_pred * y_true, axis=None))
+	up_fp_mic = tf.assign_add(
+		fp_mic, tf.count_nonzero(y_pred * (y_true - 1), axis=None)
+	)
+	up_fn_mic = tf.assign_add(
+		fn_mic, tf.count_nonzero((y_pred - 1) * y_true, axis=None)
+	)
+	# Update op for the weights, just summing
+	up_weights = tf.assign_add(weights, tf.reduce_sum(y_true, axis=0))
+
+	# Grouping values
+	counts = (tp_mac, fp_mac, fn_mac, tp_mic, fp_mic, fn_mic, weights)
+	updates = tf.group(
+		up_tp_mic, up_fp_mic, up_fn_mic, up_tp_mac, up_fp_mac, up_fn_mac, up_weights
+	)
+
+	return counts, updates
+
+
+def streaming_f1(counts):
+	"""Computes the f1 scores from the TP, FP and FN counts
+
+	Args:
+		counts (tuple): macro and micro counts, and weights in the end
+
+	Returns:
+		tuple(Tensor): The 3 tensors representing the micro, macro and weighted
+			f1 score
+	"""
+	# unpacking values
+	tp_mac, fp_mac, fn_mac, tp_mic, fp_mic, fn_mic, weights = counts
+
+	# normalize weights
+	weights = weights / tf.reduce_sum(weights)
+
+	# computing the micro f1 score
+	prec_mic = tp_mic / (tp_mic + fp_mic)
+	rec_mic = tp_mic / (tp_mic + fn_mic)
+	f1_mic = 2 * prec_mic * rec_mic / (prec_mic + rec_mic)
+	f1_mic = tf.reduce_mean(f1_mic)
+
+	# computing the macro and weighted f1 score
+	prec_mac = tp_mac / (tp_mac + fp_mac)
+	rec_mac = tp_mac / (tp_mac + fn_mac)
+	f1_mac = 2 * prec_mac * rec_mac / (prec_mac + rec_mac)
+	f1_wei = tf.reduce_sum(f1_mac * weights)
+	f1_mac_mean = tf.reduce_mean(f1_mac)
+
+	return f1_mic, f1_mac_mean, f1_wei, f1_mac
+
+
+def tf_f1_score(y_true, y_pred):
+    """Computes 3 different f1 scores, micro macro
+    weighted.
+    micro: f1 score accross the classes, as 1
+    macro: mean of f1 scores per class
+    weighted: weighted average of f1 scores per class,
+              weighted from the support of each class
+    Args:
+        y_true (Tensor): labels, with shape (batch, num_classes)
+        y_pred (Tensor): model's predictions, same shape as y_true
+    Returns:
+        tupe(Tensor): (micro, macro, weighted)
+                      tuple of the computed f1 scores
+    """
+
+    f1s = [0, 0, 0]
+
+    y_true = tf.cast(y_true, tf.float64)
+    y_pred = tf.cast(y_pred, tf.float64)
+
+    for i, axis in enumerate([None, 0]):
+        TP = tf.count_nonzero(y_pred * y_true, axis=axis)
+        FP = tf.count_nonzero(y_pred * (y_true - 1), axis=axis)
+        FN = tf.count_nonzero((y_pred - 1) * y_true, axis=axis)
+
+        precision = TP / (TP + FP)
+        recall = TP / (TP + FN)
+        f1 = 2 * precision * recall / (precision + recall)
+
+        f1s[i] = tf.reduce_mean(f1)
+
+    weights = tf.reduce_sum(y_true, axis=0)
+    weights /= tf.reduce_sum(weights)
+
+    f1s[2] = tf.reduce_sum(f1 * weights)
+
+    micro, macro, weighted = f1s
+    return micro, macro, weighted
 
 
 ################################################################################
 # Functions for input processing.
 ################################################################################
 def process_record_dataset(dataset,
-                           is_training,
-                           batch_size,
-                           shuffle_buffer,
-                           parse_record_fn,
-                           num_epochs=1,
-                           dtype=tf.float32,
-                           datasets_num_private_threads=None,
-                           num_parallel_batches=1):
+						   is_training,
+						   batch_size,
+						   shuffle_buffer,
+						   parse_record_fn,
+						   num_epochs=1,
+						   dtype=tf.float32,
+						   datasets_num_private_threads=None,
+						   num_parallel_batches=1):
 	"""Given a Dataset with raw records, return an iterator over the records.
 
   Args:
-    dataset: A Dataset representing raw records
-    is_training: A boolean denoting whether the input is for training.
-    batch_size: The number of samples per batch.
-    shuffle_buffer: The buffer size to use when shuffling records. A larger
-      value results in better randomness, but smaller values reduce startup
-      time and use less memory.
-    parse_record_fn: A function that takes a raw record and returns the
-      corresponding (image, label) pair.
-    num_epochs: The number of epochs to repeat the dataset.
-    dtype: Data type to use for images/features.
-    datasets_num_private_threads: Number of threads for a private
-      threadpool created for all datasets computation.
-    num_parallel_batches: Number of parallel batches for tf.data.
+	dataset: A Dataset representing raw records
+	is_training: A boolean denoting whether the input is for training.
+	batch_size: The number of samples per batch.
+	shuffle_buffer: The buffer size to use when shuffling records. A larger
+	  value results in better randomness, but smaller values reduce startup
+	  time and use less memory.
+	parse_record_fn: A function that takes a raw record and returns the
+	  corresponding (image, label) pair.
+	num_epochs: The number of epochs to repeat the dataset.
+	dtype: Data type to use for images/features.
+	datasets_num_private_threads: Number of threads for a private
+	  threadpool created for all datasets computation.
+	num_parallel_batches: Number of parallel batches for tf.data.
 
   Returns:
-    Dataset of (image, label) pairs ready for iteration.
+	Dataset of (image, label) pairs ready for iteration.
   """
 
 	# Prefetches a batch at a time to smooth out the time taken to load input
@@ -87,7 +246,7 @@ def process_record_dataset(dataset,
 	# Defines a specific size thread pool for tf.data operations.
 	if datasets_num_private_threads:
 		tf.logging.info('datasets_num_private_threads: %s',
-		                datasets_num_private_threads)
+						datasets_num_private_threads)
 		dataset = threadpool.override_threadpool(
 			dataset,
 			threadpool.PrivateThreadPool(
@@ -131,8 +290,8 @@ def override_flags_and_set_envars_for_gpu_thread_pool(flags_obj):
   poorly.
 
   Args:
-    flags_obj: Current flags, which will be adjusted possibly overriding
-    what has been set by the user on the command-line.
+	flags_obj: Current flags, which will be adjusted possibly overriding
+	what has been set by the user on the command-line.
   """
 	cpu_count = multiprocessing.cpu_count()
 	tf.logging.info('Logical CPU cores: %s', cpu_count)
@@ -154,7 +313,7 @@ def override_flags_and_set_envars_for_gpu_thread_pool(flags_obj):
 	# sending / receiving tensors.
 	num_monitoring_threads = 2 * flags_obj.num_gpus
 	flags_obj.datasets_num_private_threads = (cpu_count - total_gpu_thread_count
-	                                          - num_monitoring_threads)
+											  - num_monitoring_threads)
 
 
 ################################################################################
@@ -166,22 +325,22 @@ def learning_rate_with_decay(
 	"""Get a learning rate that decays step-wise as training progresses.
 
   Args:
-    batch_size: the number of examples processed in each training batch.
-    batch_denom: this value will be used to scale the base learning rate.
-      `0.1 * batch size` is divided by this number, such that when
-      batch_denom == batch_size, the initial learning rate will be 0.1.
-    num_images: total number of images that will be used for training.
-    boundary_epochs: list of ints representing the epochs at which we
-      decay the learning rate.
-    decay_rates: list of floats representing the decay rates to be used
-      for scaling the learning rate. It should have one more element
-      than `boundary_epochs`, and all elements should have the same type.
-    base_lr: Initial learning rate scaled based on batch_denom.
-    warmup: Run a 5 epoch warmup to the initial lr.
+	batch_size: the number of examples processed in each training batch.
+	batch_denom: this value will be used to scale the base learning rate.
+	  `0.1 * batch size` is divided by this number, such that when
+	  batch_denom == batch_size, the initial learning rate will be 0.1.
+	num_images: total number of images that will be used for training.
+	boundary_epochs: list of ints representing the epochs at which we
+	  decay the learning rate.
+	decay_rates: list of floats representing the decay rates to be used
+	  for scaling the learning rate. It should have one more element
+	  than `boundary_epochs`, and all elements should have the same type.
+	base_lr: Initial learning rate scaled based on batch_denom.
+	warmup: Run a 5 epoch warmup to the initial lr.
   Returns:
-    Returns a function that takes a single argument - the number of batches
-    trained so far (global_step)- and returns the learning rate to be used
-    for training the next batch.
+	Returns a function that takes a single argument - the number of batches
+	trained so far (global_step)- and returns the learning rate to be used
+	for training the next batch.
   """
 	initial_learning_rate = base_lr * batch_size / batch_denom
 	batches_per_epoch = num_images / batch_size
@@ -207,10 +366,10 @@ def learning_rate_with_decay(
 
 
 def resnet_model_fn(features, labels, mode, model_class,
-                    resnet_size, weight_decay, learning_rate_fn, momentum,
-                    data_format, resnet_version, loss_scale,
-                    loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
-                    fine_tune=False):
+					resnet_size, weight_decay, learning_rate_fn, momentum,
+					data_format, resnet_version, loss_scale,
+					loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
+					fine_tune=False):
 	"""Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -221,61 +380,62 @@ def resnet_model_fn(features, labels, mode, model_class,
   a data_batch_1.bin op, but with the necessary parameters for the given mode.
 
   Args:
-    features: tensor representing input images
-    labels: tensor representing class labels for all input images
-    mode: current estimator mode; should be one of
-      `tf.estimator.ModeKeys.TRAIN`, `EVALUATE`, `PREDICT`
-    model_class: a class representing a TensorFlow model that has a __call__
-      function. We assume here that this is a subclass of ResnetModel.
-    resnet_size: A single integer for the size of the ResNet model.
-    weight_decay: weight decay loss rate used to regularize learned variables.
-    learning_rate_fn: function that returns the current learning rate given
-      the current global_step
-    momentum: momentum term used for optimization
-    data_format: Input format ('channels_last', 'channels_first', or None).
-      If set to None, the format is dependent on whether a GPU is available.
-    resnet_version: Integer representing which version of the ResNet network to
-      use. See README for details. Valid values: [1, 2]
-    loss_scale: The factor to scale the loss for numerical stability. A detailed
-      summary is present in the arg parser help text.
-    loss_filter_fn: function that takes a string variable name and returns
-      True if the var should be included in loss calculation, and False
-      otherwise. If None, batch_normalization variables will be excluded
-      from the loss.
-    dtype: the TensorFlow dtype to use for calculations.
-    fine_tune: If True only data_batch_1.bin the dense layers(final layers).
+	features: tensor representing input images
+	labels: tensor representing class labels for all input images
+	mode: current estimator mode; should be one of
+	  `tf.estimator.ModeKeys.TRAIN`, `EVALUATE`, `PREDICT`
+	model_class: a class representing a TensorFlow model that has a __call__
+	  function. We assume here that this is a subclass of ResnetModel.
+	resnet_size: A single integer for the size of the ResNet model.
+	weight_decay: weight decay loss rate used to regularize learned variables.
+	learning_rate_fn: function that returns the current learning rate given
+	  the current global_step
+	momentum: momentum term used for optimization
+	data_format: Input format ('channels_last', 'channels_first', or None).
+	  If set to None, the format is dependent on whether a GPU is available.
+	resnet_version: Integer representing which version of the ResNet network to
+	  use. See README for details. Valid values: [1, 2]
+	loss_scale: The factor to scale the loss for numerical stability. A detailed
+	  summary is present in the arg parser help text.
+	loss_filter_fn: function that takes a string variable name and returns
+	  True if the var should be included in loss calculation, and False
+	  otherwise. If None, batch_normalization variables will be excluded
+	  from the loss.
+	dtype: the TensorFlow dtype to use for calculations.
+	fine_tune: If True only data_batch_1.bin the dense layers(final layers).
 
   Returns:
-    EstimatorSpec parameterized according to the input params and the
-    current mode.
+	EstimatorSpec parameterized according to the input params and the
+	current mode.
   """
 
 	# Generate a summary node for the images
-	tf.summary.image('images', features, max_outputs=6)
+	tf.summary.image('images', features['x'], max_outputs=8)
 	# Checks that features/images have same data type being used for calculations.
-	assert features.dtype == dtype
+	assert features['x'].dtype == dtype
 
 	model = model_class(resnet_size, data_format, resnet_version=resnet_version,
-	                    dtype=dtype)
+						dtype=dtype)
 
 
-	logits = model(features, mode == tf.estimator.ModeKeys.TRAIN)
+	logits = model(features['x'], mode == tf.estimator.ModeKeys.TRAIN)
 
 	# This acts as a no-op if the logits are already in fp32 (provided logits are
 	# not a SparseTensor). If dtype is is low precision, logits must be cast to
 	# fp32 for numerical stability.
 	logits = tf.cast(logits, tf.float32)
-	logits = tf.nn.sigmoid(logits)
 
 	def multi_label_hot(prediction, threshold=0.3):
 		prediction = tf.cast(prediction, tf.float32)
 		threshold = float(threshold)
 		return tf.cast(tf.greater(prediction, threshold), tf.int64)
 
+
 	predictions = {
-		# 'classes': tf.argmax(logits, axis=1),
-		'k_hot_prediction':multi_label_hot(logits),
-		'probabilities':tf.nn.softmax(logits, name='softmax_tensor')
+		'k_hot_predictions': multi_label_hot(tf.nn.sigmoid(logits)),
+		'probabilities': tf.nn.sigmoid(logits, name='sigmoid_tensor'),
+		'logits': logits,
+		'labels': features['y']
 	}
 
 	if mode == tf.estimator.ModeKeys.PREDICT:
@@ -291,8 +451,14 @@ def resnet_model_fn(features, labels, mode, model_class,
 	# cross_entropy = tf.losses.sparse_softmax_cross_entropy(
 	#     logits=logits, labels=labels)
 
-	cross_entropy = tf.losses.softmax_cross_entropy(
-		logits=logits, onehot_labels=labels)
+	# cross_entropy = tf.losses.softmax_cross_entropy(
+		#     logits=logits, one_labels=labels)
+
+
+	# tf.losses.sigmoid_cross_entropy in addition allows to set the in-batch weights, i.e. make some examples more
+	# important than others.
+	cross_entropy = tf.losses.sigmoid_cross_entropy(
+		logits=logits, multi_class_labels=labels)
 
 	# Create a tensor named cross_entropy for logging purposes.
 	tf.identity(cross_entropy, name='cross_entropy')
@@ -330,13 +496,13 @@ def resnet_model_fn(features, labels, mode, model_class,
 		def _dense_grad_filter(gvs):
 			"""Only apply gradient updates to the final layer.
 
-      This function is used for fine tuning.
+	  This function is used for fine tuning.
 
-      Args:
-        gvs: list of tuples with gradients and variable info
-      Returns:
-        filtered gradients so that only the dense layer remains
-      """
+	  Args:
+		gvs: list of tuples with gradients and variable info
+	  Returns:
+		filtered gradients so that only the dense layer remains
+	  """
 			return [(g, v) for g, v in gvs if 'dense' in v.name]
 
 		if loss_scale != 1:
@@ -351,7 +517,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 			# Once the gradient computation is complete we can scale the gradients
 			# back to the correct scale before passing them to the optimizer.
 			unscaled_grad_vars = [(grad / loss_scale, var)
-			                      for grad, var in scaled_grad_vars]
+								  for grad, var in scaled_grad_vars]
 			minimize_op = optimizer.apply_gradients(unscaled_grad_vars, global_step)
 		else:
 			grad_vars = optimizer.compute_gradients(loss)
@@ -364,117 +530,29 @@ def resnet_model_fn(features, labels, mode, model_class,
 	else:
 		train_op = None
 
-	def metric_variable(shape, dtype, validate_shape=True, name=None):
-		"""Create variable in `GraphKeys.(LOCAL|METRIC_VARIABLES`) collections."""
+	p = tf.cast(predictions['k_hot_predictions'], tf.int32)
+	b = tf.pow(2, tf.range(0, model.num_classes))
+	b = tf.reshape(b,[model.num_classes, 1])
+	l = tf.matmul(a=labels,b=b)
+	p = tf.matmul(a=p,b=b)
+	accuracy = tf.metrics.accuracy(labels=l, predictions=p)
 
-		return variable_scope.variable(
-			lambda:array_ops.zeros(shape, dtype),
-			trainable=False,
-			collections=[ops.GraphKeys.LOCAL_VARIABLES, ops.GraphKeys.METRIC_VARIABLES],
-			validate_shape=validate_shape,
-			name=name,
-		)
-
-	def streaming_counts(y_true, y_pred, num_classes):
-		# Weights for the weighted f1 score
-
-		y_true = tf.cast(y_true,tf.int64)
-
-		weights = metric_variable(
-			shape=[num_classes], dtype=tf.int64, validate_shape=False, name="weights"
-		)
-		# Counts for the macro f1 score
-		tp_mac = metric_variable(
-			shape=[num_classes], dtype=tf.int64, validate_shape=False, name="tp_mac"
-		)
-		fp_mac = metric_variable(
-			shape=[num_classes], dtype=tf.int64, validate_shape=False, name="fp_mac"
-		)
-		fn_mac = metric_variable(
-			shape=[num_classes], dtype=tf.int64, validate_shape=False, name="fn_mac"
-		)
-		# Counts for the micro f1 score
-		tp_mic = metric_variable(
-			shape=[], dtype=tf.int64, validate_shape=False, name="tp_mic"
-		)
-		fp_mic = metric_variable(
-			shape=[], dtype=tf.int64, validate_shape=False, name="fp_mic"
-		)
-		fn_mic = metric_variable(
-			shape=[], dtype=tf.int64, validate_shape=False, name="fn_mic"
-		)
-
-		# Update ops, as in the previous section:
-		#   - Update ops for the macro f1 score
-		up_tp_mac = tf.assign_add(tp_mac, tf.count_nonzero(y_pred * y_true, axis=0))
-		up_fp_mac = tf.assign_add(fp_mac, tf.count_nonzero(y_pred * y_true-1, axis=0))
-		up_fn_mac = tf.assign_add(fn_mac, tf.count_nonzero((y_pred - 1) * y_true, axis=0))
-
-		#   - Update ops for the micro f1 score
-		up_tp_mic = tf.assign_add(
-			tp_mic, tf.count_nonzero(y_pred * y_true, axis=None)
-		)
-		up_fp_mic = tf.assign_add(
-			fp_mic, tf.count_nonzero(y_pred * (y_true - 1), axis=None)
-		)
-		up_fn_mic = tf.assign_add(
-			fn_mic, tf.count_nonzero((y_pred - 1) * y_true, axis=None)
-		)
-		# Update op for the weights, just summing
-		up_weights = tf.assign_add(weights, tf.reduce_sum(y_true, axis=0))
-
-		# Grouping values
-		counts = (tp_mac, fp_mac, fn_mac, tp_mic, fp_mic, fn_mic, weights)
-		updates = tf.group(up_tp_mic, up_fp_mic, up_fn_mic, up_tp_mac, up_fp_mac, up_fn_mac, up_weights)
-
-		return counts, updates
-
-	def streaming_f1(counts):
-		# unpacking values
-		tp_mac, fp_mac, fn_mac, tp_mic, fp_mic, fn_mic, weights = counts
-
-		# normalize weights
-		weights = weights/tf.reduce_sum(weights)
-
-		# computing the micro f1 score
-		prec_mic = tp_mic / (tp_mic + fp_mic)
-		rec_mic = tp_mic / (tp_mic + fn_mic)
-		f1_mic = 2 * prec_mic * rec_mic / (prec_mic + rec_mic)
-		f1_mic = tf.reduce_mean(f1_mic)
-
-		# computing the macro and wieghted f1 score
-		prec_mac = tp_mac / (tp_mac + fp_mac)
-		rec_mac = tp_mac / (tp_mac + fn_mac)
-		f1_mac = 2 * prec_mac * rec_mac / (prec_mac + rec_mac)
-		f1_wei = tf.reduce_sum(f1_mac * weights)
-		f1_mac = tf.reduce_mean(f1_mac)
-
-		return f1_mic, f1_mac, f1_wei
-
-	f1s, f1_updates = streaming_counts(labels, tf.cast(predictions['k_hot_prediction'], tf.int64), model.num_classes)
-	micro_f1, macro_f1, weighted_f1 = streaming_f1(f1s)
-
-	# accuracy = tf.metrics.accuracy(labels, predictions['classes'])
-	accuracy = tf.metrics.accuracy(labels, tf.cast(predictions['k_hot_prediction'], tf.int64))
+	f1 = tf_f1_score(labels, tf.cast(predictions['k_hot_predictions'], tf.int64))
+	counts, update = streaming_counts(labels, tf.cast(predictions['k_hot_predictions'], tf.int64), model.num_classes)
+	streamed_f1 = streaming_f1(counts)
 
 	metrics = {
-		"accuracy":accuracy,
-		"macro":(macro_f1, f1_updates),
+		"accuracy": accuracy,
+		"f1_per_class": (streamed_f1[3], update),
 	}
 
-
-	# metrics = {'accuracy': accuracy,
-	#            'f1': macro_f1}
-
-	# accuracy[0] is local/ batch-wise
-	# accuracy[1] is updated
-
-	# Create a tensor named train_accuracy for logging purposes
 	tf.identity(accuracy[1], name='train_accuracy')
-	tf.identity(macro_f1, name='f1-macro')
-	tf.summary.scalar('train_accuracy', accuracy[0])
-	tf.summary.scalar('f1-macro', macro_f1)
+	tf.identity(streamed_f1[1], name='f1_cum')
+	tf.identity(f1[1], name='f1_overall')
 
+	tf.summary.scalar('train_accuracy', accuracy[1])
+	tf.summary.scalar('f1_cum', streamed_f1[1])
+	tf.summary.scalar('f1_overall', f1[1])
 
 	return tf.estimator.EstimatorSpec(
 		mode=mode,
@@ -489,17 +567,17 @@ def resnet_main(
 	"""Shared main loop for ResNet Models.
 
   Args:
-    flags_obj: An object containing parsed flags. See define_resnet_flags()
-      for details.
-    model_function: the function that instantiates the Model and builds the
-      ops for data_batch_1.bin/eval. This will be passed directly into the estimator.
-    input_function: the function that processes the dataset and returns a
-      dataset that the estimator can dataset on. This will be wrapped with
-      all the relevant flags for running and passed to estimator.
-    dataset_name: the name of the dataset for training and evaluation. This is
-      used for logging purpose.
-    shape: list of ints representing the shape of the images used for training.
-      This is only used if flags_obj.export_dir is passed.
+	flags_obj: An object containing parsed flags. See define_resnet_flags()
+	  for details.
+	model_function: the function that instantiates the Model and builds the
+	  ops for data_batch_1.bin/eval. This will be passed directly into the estimator.
+	input_function: the function that processes the dataset and returns a
+	  dataset that the estimator can dataset on. This will be wrapped with
+	  all the relevant flags for running and passed to estimator.
+	dataset_name: the name of the dataset for training and evaluation. This is
+	  used for logging purpose.
+	shape: list of ints representing the shape of the images used for training.
+	  This is only used if flags_obj.export_dir is passed.
   """
 
 	model_helpers.apply_clean(flags.FLAGS)
@@ -558,7 +636,7 @@ def resnet_main(
 
 	benchmark_logger = logger.get_benchmark_logger()
 	benchmark_logger.log_run_info('resnet', dataset_name, run_params,
-	                              test_id=flags_obj.benchmark_test_id)
+								  test_id=flags_obj.benchmark_test_id)
 
 	train_hooks = hooks_helper.get_train_hooks(
 		flags_obj.hooks,
@@ -568,7 +646,7 @@ def resnet_main(
 	def input_fn_train(num_epochs):
 		return input_function(
 			is_training=True,
-			data_dir=os.path.join(flags_obj.data_dir,'train'),
+			data_dir=os.path.join(flags_obj.data_dir, 'train'),
 			batch_size=distribution_utils.per_device_batch_size(
 				flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
 			num_epochs=num_epochs,
@@ -606,7 +684,7 @@ def resnet_main(
 
 		if num_train_epochs:
 			classifier.train(input_fn=lambda:input_fn_train(num_train_epochs),
-			                 hooks=train_hooks, max_steps=flags_obj.max_train_steps)
+							 hooks=train_hooks, max_steps=flags_obj.max_train_steps)
 
 		tf.logging.info('Starting to evaluate.')
 
@@ -617,7 +695,15 @@ def resnet_main(
 		# Note that eval will run for max_train_steps each loop, regardless of the
 		# global_step count.
 		eval_results = classifier.evaluate(input_fn=input_fn_eval,
-		                                   steps=flags_obj.max_train_steps)
+										   steps=flags_obj.max_train_steps)
+
+		pred_results = classifier.predict(input_fn=input_fn_eval)
+
+		pred = []
+		for p in pred_results:
+			pred.append(np.concatenate((p['logits'], p['k_hot_predictions'], p['labels'])))
+		pred = np.array(pred)
+		np.savetxt('test_result_{}.csv'.format(flags_obj.model_dir[:-1]), pred, delimiter=',')
 
 		benchmark_logger.log_evaluation_result(eval_results)
 
@@ -635,16 +721,16 @@ def resnet_main(
 			input_receiver_fn = export.build_tensor_serving_input_receiver_fn(
 				shape, batch_size=flags_obj.batch_size, dtype=export_dtype)
 		classifier.export_savedmodel(flags_obj.export_dir, input_receiver_fn,
-		                             strip_default_attrs=True)
+									 strip_default_attrs=True)
 
 
 def define_resnet_flags(resnet_size_choices=None):
 	"""Add flags and validators for ResNet."""
 	flags_core.define_base()
 	flags_core.define_performance(num_parallel_calls=False,
-	                              tf_gpu_thread_mode=True,
-	                              datasets_num_private_threads=True,
-	                              datasets_num_parallel_batches=True)
+								  tf_gpu_thread_mode=True,
+								  datasets_num_private_threads=True,
+								  datasets_num_parallel_batches=True)
 	flags_core.define_image()
 	flags_core.define_benchmark()
 	flags.adopt_module_key_flags(flags_core)
@@ -666,7 +752,7 @@ def define_resnet_flags(resnet_size_choices=None):
 	flags.DEFINE_boolean(
 		name='eval_only', default=False,
 		help=flags_core.help_wrap('Skip training and only perform evaluation on '
-		                          'the latest checkpoint.'))
+								  'the latest checkpoint.'))
 	flags.DEFINE_boolean(
 		name='image_bytes_as_serving_input', default=False,
 		help=flags_core.help_wrap(

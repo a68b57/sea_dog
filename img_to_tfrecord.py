@@ -2,7 +2,6 @@ import pandas as pd
 import tensorflow as tf
 import glob, os, sys
 from random import shuffle
-from matplotlib import image as im
 from PIL import Image
 import numpy as np
 
@@ -20,8 +19,6 @@ def _int64_list_feature(value):
 
 
 def load_image(infilename):
-	# with tf.gfile.GFile(infilename, 'rb') as fid:
-	# 	image = fid.read()
 	image = Image.open(infilename)
 	image = np.asarray(image, np.uint8)
 	return image.tobytes()
@@ -33,10 +30,10 @@ def createDataRecord(out_dir, addrs, labels):
 	if not os.path.exists(out_dir):
 		os.makedirs(out_dir)
 
-	writer = tf.python_io.TFRecordWriter(os.path.join(out_dir, 'data'))
+	writer = tf.python_io.TFRecordWriter(os.path.join(out_dir, 'data.tfrecord'))
 	for i in range(len(addrs)):
 		if not i % 1000:
-			print('Train data: {}/{}'.format(i, len(addrs)))
+			print('create data: {}/{}'.format(i, len(addrs)))
 			sys.stdout.flush()
 		img = load_image(addrs[i])
 
@@ -48,7 +45,10 @@ def createDataRecord(out_dir, addrs, labels):
 			'label0':_int64_feature(labels[i][0]),
 			'label1':_int64_feature(labels[i][1]),
 			'label2':_int64_feature(labels[i][2]),
-			'label3':_int64_feature(labels[i][3])
+			'label3':_int64_feature(labels[i][3]),
+			'label4':_int64_feature(labels[i][4]),
+			'label5':_int64_feature(labels[i][5]),
+			'label6':_int64_feature(labels[i][6])
 		}
 		example = tf.train.Example(features=tf.train.Features(feature=feature))
 
@@ -59,30 +59,34 @@ def createDataRecord(out_dir, addrs, labels):
 
 
 df = pd.read_csv('pilotCNNselection.csv', header=0, usecols=['Id', 'Nucleoplasm', 'Nuclear.membrane', 'Nucleoli',
+                                                             'Nucleoli.fibrillar.center', 'Nuclear.speckles','Nuclear.bodies',
 															 'pilotCNN'])
 
 image_path = 'train_nucleus/*tif'
 addrs = glob.glob(image_path)
 labels = []
-
+num_class = 7
+j = 0
 for i, addr in enumerate(addrs):
 	id = os.path.basename(addr).split('_')[0]
-	label = df.loc[df['Id'] == id].values[0][1:4]
+	label = df.loc[df['Id'] == id].values[0][1:num_class]
 	label = label * 1
 	label = label.tolist()
 	if 1 in label:
 		label.append(0)
 	else:
 		label.append(1)
-
+		j = j + 1
 	labels.append(label)
+
+print(j)
 
 c = list(zip(addrs, labels))
 shuffle(c)
 addrs, labels = zip(*c)
 
-train_addrs = addrs[0:int(0.1 * len(addrs))]
-train_labels = labels[0:int(0.1 * len(labels))]
+train_addrs = addrs[0:int(0.8 * len(addrs))]
+train_labels = labels[0:int(0.8 * len(labels))]
 val_addrs = addrs[int(0.8*len(addrs)):int(0.9*len(addrs))]
 val_labels = labels[int(0.8*len(addrs)):int(0.9*len(addrs))]
 test_addrs = addrs[int(0.9 * len(addrs)):]

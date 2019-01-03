@@ -15,13 +15,14 @@ _WIDTH = 512
 _NUM_CHANNELS = 1
 _DEFAULT_IMAGE_BYTES = _HEIGHT * _WIDTH * _NUM_CHANNELS
 _RECORD_BYTES = _DEFAULT_IMAGE_BYTES
-_NUM_CLASSES = 4
+# _NUM_CLASSES = 4
+_NUM_CLASSES = 7
 _NUM_DATA_FILES = 1
 
 
 
 _NUM_IMAGES = {
-	'train':3107, # total train 3107  # test: 6215
+	'train':24856, # total train 3107  # test: 6215
 	'validation':3107,
 }
 
@@ -40,7 +41,10 @@ def parse_record(raw_record, is_training, dtype):
 		'label0':tf.FixedLenFeature([], tf.int64),
 		'label1':tf.FixedLenFeature([], tf.int64),
 		'label2':tf.FixedLenFeature([], tf.int64),
-		'label3':tf.FixedLenFeature([], tf.int64)
+		'label3':tf.FixedLenFeature([], tf.int64),
+		'label4':tf.FixedLenFeature([], tf.int64),
+		'label5':tf.FixedLenFeature([], tf.int64),
+		'label6':tf.FixedLenFeature([], tf.int64)
 	}
 
 	parsed = tf.parse_single_example(raw_record, keys_to_features)
@@ -53,10 +57,15 @@ def parse_record(raw_record, is_training, dtype):
 	label1 = parsed["label1"]
 	label2 = parsed["label2"]
 	label3 = parsed["label3"]
-	label = tf.stack([label0,label1,label2,label3])
+	label4 = parsed["label4"]
+	label5 = parsed["label5"]
+	label6 = parsed["label6"]
+	label = tf.stack([label0,label1,label2,label3,label4,label5,label6])
 	label = tf.cast(label, tf.int32)
 
-	return image, label
+	features = dict(x=image, y=label)
+
+	return features, label
 
 
 def preprocess_image(image, is_training):
@@ -80,7 +89,7 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
 	Returns:
 	  A dataset that can be used for iteration.
 	"""
-	filenames = os.path.join(data_dir, 'data')
+	filenames = os.path.join(data_dir, 'data.tfrecord')
 
 	# dataset = tf.data.FixedLengthRecordDataset(filenames, _RECORD_BYTES) # this only works for CIFAR
 	dataset = tf.data.TFRecordDataset(filenames, buffer_size=_RECORD_BYTES)
@@ -147,7 +156,7 @@ class pilotCNNModel(resnet_model.Model):
 
 
 def pilotCNN_model_fn(features, labels, mode, params):
-	features = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _NUM_CHANNELS])
+	features['x'] = tf.reshape(features['x'], [-1, _HEIGHT, _WIDTH, _NUM_CHANNELS])
 	learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
 		batch_size=params['batch_size'], batch_denom=64,
 		num_images=_NUM_IMAGES['train'], boundary_epochs=[91, 136, 182],
@@ -182,13 +191,15 @@ def define_flags():
 	cwd = os.path.dirname(os.path.realpath(__file__))
 
 	flags_core.set_defaults(data_dir=os.path.join(cwd,'tfrecord'),
-	                        model_dir='model/',
-	                        resnet_size='14',
-	                        train_epochs=1000,
+	                        model_dir='model_sigmoid_cross_entropy_7class/',
+	                        # model_dir='model_sigmoid_cross_entropy/',
+	                        # resnet_size='26', # 26 is hy
+	                        resnet_size='20',
+	                        train_epochs=50,
 	                        epochs_between_evals=1,
-	                        batch_size=3,
+	                        batch_size=5, # 8 is hy
 	                        image_bytes_as_serving_input=False,
-	                        eval_only = False)
+	                        eval_only = True)
 
 
 def run_pilotCNN(flags_obj):
